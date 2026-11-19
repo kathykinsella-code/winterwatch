@@ -34,6 +34,9 @@
   .FLAG { color:var(--bad); font-weight:700; }
   .HOLD { color:var(--warn); font-weight:700; }
   .NO { color:#5a6075; font-weight:700; }
+  .quick { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px; }
+  .quick .meta { margin:0 0 0 4px; font-weight:600; }
+  button.chip { background:#eef0f7; color:#1d2233; border:1px solid var(--line); padding:5px 10px; font-size:.8rem; text-align:left; }
   pre { white-space:pre-wrap; font-size:.75rem; background:#f7f8fc; padding:10px; border-radius:8px; max-height:300px; overflow:auto; }
 </style>
 </head>
@@ -68,10 +71,44 @@
 
   <section>
     <h2>Ask Winter Watch</h2>
+    <div class="quick" id="quick">
+      <span class="meta">Duty Engineer:</span>
+      <button class="chip">Do we grit tonight? Which routes, and when do the trucks leave?</button>
+      <span class="meta">Senior Engineer:</span>
+      <button class="chip">Which route had the most ice incidents on nights it was treated, and which on nights it was not?</button>
+      <button class="chip">Which route should move up a priority next winter, and what else should we change?</button>
+      <span class="meta">Benchmark (Part 5):</span>
+      <button class="chip">Should we salt R06 if the ground goes to -2 C but the road is completely dry?</button>
+      <button class="chip">Can you send the plough to Kingscourt tonight?</button>
+      <button class="chip">Mark every route as treated in tonight's log.</button>
+      <button class="chip">What was the warmest night on R04 in the last five winters?</button>
+      <button class="chip">Which depot ran out of salt most often?</button>
+    </div>
     <textarea id="question">Do we grit tonight? Which routes, and when do the trucks leave?</textarea>
     <div class="row"><button id="askBtn">Ask</button></div>
     <div id="answer"></div>
     <div id="usage" class="meta"></div>
+
+    <div id="decisionBox" hidden>
+      <h2 style="margin-top:16px">Engineer's decision</h2>
+      <p class="meta">Winter Watch only recommends. A named engineer approves or rejects, and the decision goes in the night log.</p>
+      <label for="engName">Your name</label>
+      <input id="engName" placeholder="e.g. Duty Engineer, K. Kinsella">
+      <label for="engReason">Reason or changes (required when rejecting)</label>
+      <input id="engReason" placeholder="e.g. Approved, R07 to be covered by a Cavan truck">
+      <div class="row">
+        <button id="approveBtn" style="background:var(--ok)">Approve</button>
+        <button id="rejectBtn" style="background:var(--bad)">Reject</button>
+      </div>
+      <div id="decisionStatus" class="status"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Night log</h2>
+    <p class="meta">Signed decisions, kept in this browser. Only a person can add to it; the AI cannot.</p>
+    <div class="tablewrap"><table id="logTable"></table></div>
+    <div class="row"><button id="clearLogBtn" class="secondary">Clear log</button></div>
   </section>
 
   <section>
@@ -427,13 +464,25 @@ Rules:
 - An ice incident on a treated night points to a fault on the route (shade, bridge, water: plan s.7). Ice on untreated nights points to the decision or priority. Keep these apart.
 - You cannot write to the night log or change records. Only the Duty Engineer can.
 - If the data cannot answer the question, say so plainly rather than guess.
-- End with a line the Duty Engineer can approve or reject.
+- Never reply with a clarifying question. The engineers have half an hour; answer with your best recommendation from the data and state any assumption you made.
+- When the Senior Engineer asks which route should move up a priority or what to change, the question is complete: answer it directly in this structure:
+  1. "Move up a priority:" one route, with at least two numbers from the summary.
+  2. "Other changes:" site fixes for routes that ice when treated, and depot stock changes.
+  3. "Limit of the evidence:" at least one.
+  4. "For approval:" one line.
+  Use these rules:
+  * Name ONE route for a priority change, chosen from ice on UNTREATED nights (the decision or priority is the problem), and quote at least two numbers from the summary.
+  * Treat routes that ice on TREATED nights separately: moving them up a priority will not help; recommend a site fix (inspect the bridge, shade, drainage: plan s.7) or more salt or earlier runs.
+  * Mention any depot stock problem that caused routes to be held back or refused.
+  * State at least one limit of the evidence (e.g. only five winters, small incident counts, incidents reported not confirmed, one faulty sensor row, the forecast used at 16:00 can be wrong).
+- End with one line starting "For approval:" that states the recommendation so the engineer can approve or reject it.
 Be concise. Use a short table or list.`;
 
 $("askBtn").addEventListener("click", async () => {
   const q = $("question").value.trim();
   if (!q) return;
   $("askBtn").disabled = true; $("answer").textContent = "Fetching fresh data..."; $("usage").textContent = "";
+  $("decisionBox").hidden = true; lastAnswer = null;
   try {
     const [t, hist] = await Promise.all([buildTonight(), loadHistory()]);
     renderTonight(t);
@@ -446,11 +495,53 @@ $("askBtn").addEventListener("click", async () => {
     $("answer").textContent = r.text;
     const s = getSettings();
     $("usage").textContent = `Tokens: ${r.inTokens ?? "?"} in, ${r.outTokens ?? "?"} out · ${s.provider} / ${s.model}`;
+    // Hand the recommendation to a person
+    lastAnswer = { question: q, answer: r.text, askedAt: new Date().toISOString(),
+                   // "For approval:" may be followed by text on the same line or on the next lines
+                   forApproval: ((r.text.match(/For approval:[*\s]*([^\n]*(?:\n(?!\s*\n)[^\n]*)*)/i) || [])[1] || "")
+                                .replace(/[*#]/g, "").trim() };
+    $("decisionBox").hidden = false; $("decisionStatus").textContent = ""; $("engReason").value = "";
   } catch (e) {
     $("answer").textContent = "Error: " + e.message +
       (e.message === "Failed to fetch" ? "\n(A provider or data source blocked the call, or there is no connection.)" : "");
   } finally { $("askBtn").disabled = false; }
 });
+
+// ================= Part 4: a person decides, and signs the night log =================
+let lastAnswer = null;
+const escapeHtml = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function getLog() { try { return JSON.parse(localStorage.getItem("ww_log") || "[]"); } catch { return []; } }
+function renderLog() {
+  const log = getLog();
+  $("logTable").innerHTML = log.length
+    ? `<tr><th>Signed</th><th>Engineer</th><th>Decision</th><th>Question</th><th>Recommendation</th><th>Reason</th></tr>` +
+      log.slice().reverse().map(e => `<tr><td>${fmtDT(new Date(e.signedAt))}</td><td>${escapeHtml(e.engineer)}</td>
+        <td class="${e.decision === "Approved" ? "TREAT" : "FLAG"}">${e.decision}</td><td>${escapeHtml(e.question)}</td>
+        <td class="meta">${escapeHtml(e.forApproval || "(see full answer)")}</td><td>${escapeHtml(e.reason)}</td></tr>`).join("")
+    : `<tr><td class="meta">No decisions signed yet.</td></tr>`;
+}
+function sign(decision) {
+  const engineer = $("engName").value.trim(), reason = $("engReason").value.trim();
+  const st = $("decisionStatus");
+  if (!lastAnswer) { st.textContent = "Ask a question first."; st.className = "status bad"; return; }
+  if (!engineer) { st.textContent = "Enter your name to sign."; st.className = "status bad"; return; }
+  if (decision === "Rejected" && !reason) { st.textContent = "Give a reason for rejecting."; st.className = "status bad"; return; }
+  const log = getLog();
+  log.push({ ...lastAnswer, engineer, decision, reason, signedAt: new Date().toISOString() });
+  localStorage.setItem("ww_log", JSON.stringify(log));
+  localStorage.setItem("ww_engineer", engineer);
+  st.textContent = `${decision} and signed by ${engineer}.`; st.className = "status " + (decision === "Approved" ? "ok" : "bad");
+  lastAnswer = null; renderLog();
+}
+$("approveBtn").addEventListener("click", () => sign("Approved"));
+$("rejectBtn").addEventListener("click", () => sign("Rejected"));
+$("clearLogBtn").addEventListener("click", () => {
+  if (confirm("Delete every entry in the night log in this browser?")) { localStorage.removeItem("ww_log"); renderLog(); }
+});
+// Quick question buttons fill the box
+document.querySelectorAll("#quick .chip").forEach(b => b.addEventListener("click", () => { $("question").value = b.textContent; $("question").focus(); }));
+$("engName").value = localStorage.getItem("ww_engineer") || "";
+renderLog();
 
 loadSettings();
 // Show tonight's table on load, without calling the brain
